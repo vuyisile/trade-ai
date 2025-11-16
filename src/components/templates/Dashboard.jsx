@@ -1,20 +1,31 @@
 import React from 'react';
+import { INITIAL_PRICE } from '../../utils/simulation';
+import { formatPnl, formatPrice, getActionStyle as getActionStyleHelper } from '../../utils/helpers';
 import MetricItem from '../atoms/MetricItem';
 import DataBox from '../atoms/DataBox';
 import OrderBookDisplay from '../organisms/OrderBookDisplay';
 import TradeHistoryTable from '../organisms/TradeHistoryTable';
 
-const Dashboard = ({ data, currentPosition, balance, tradeHistory, totalPnl, formatPrice, formatPnl, stockTicker }) => {
-    const totalBuyCost = tradeHistory.filter(t => t.action === 'BUY').reduce((sum, t) => sum + (t.price * t.shares) + t.fee, 0);
+// simple action -> style helper fallback (used for Last Action badge color)
+// prefer helper's getActionStyle if provided, otherwise use internal
+const getActionStyle = (action) => {
+    if (typeof getActionStyleHelper === 'function') return getActionStyleHelper(action);
+    if (action === 'BUY') return { color: 'text-green-600', label: 'BUY' };
+    if (action === 'SELL') return { color: 'text-red-600', label: 'SELL' };
+    return { color: 'text-gray-500', label: 'PASS' };
+};
+
+const Dashboard = ({ data, currentPosition, balance, tradeHistory, stockTicker }) => {
+    const totalBuyCost = tradeHistory.filter(t => t.action === 'BUY').reduce((sum, t) => sum + (t.price * t.shares) + (t.fee || 0), 0);
     const currentMarketValue = currentPosition * data.currentPrice;
     const unrealizedPnl = currentMarketValue - totalBuyCost;
 
     const realizedPnl = tradeHistory
         .filter(t => t.action === 'CLOSE_LONG')
-        .reduce((sum, t) => sum + t.pnl, 0);
-    const totalPnl = realizedPnl + unrealizedPnl;
+        .reduce((sum, t) => sum + (t.pnl || 0), 0);
+    const totalPnlAdjusted = realizedPnl + unrealizedPnl;
 
-    const pnlStyle = totalPnl >= 0 ? 'text-green-500' : 'text-red-500';
+    const pnlStyle = totalPnlAdjusted >= 0 ? 'text-green-500' : 'text-red-500';
 
     return (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
@@ -25,7 +36,7 @@ const Dashboard = ({ data, currentPosition, balance, tradeHistory, totalPnl, for
                     <MetricItem label="Current Position (Units)" value={`${currentPosition.toFixed(0)}`} color="text-indigo-600" />
                     <MetricItem label="Current Price" value={formatPrice(data.currentPrice)} color={data.currentPrice - INITIAL_PRICE >= 0 ? 'text-green-600' : 'text-red-600'} />
                     <MetricItem label="RSI" value={data.rsi.toFixed(2)} color={data.rsi > 70 ? 'text-red-500' : data.rsi < 30 ? 'text-green-500' : 'text-yellow-500'} />
-                    <MetricItem label="Total P&L (Net USD)" value={formatPnl(totalPnl)} color={pnlStyle} />
+                    <MetricItem label="Total P&L (Net USD)" value={formatPnl(totalPnlAdjusted)} color={pnlStyle} />
                     <MetricItem label="Realized P&L" value={formatPnl(realizedPnl)} color={realizedPnl >= 0 ? 'text-green-600' : 'text-red-600'} />
                 </div>
             </div>

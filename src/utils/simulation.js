@@ -1,6 +1,6 @@
 // This file contains utility functions for generating simulated market data, including generating initial data and simulating market changes.
 
-const INITIAL_PRICE = 1.10550;
+export const INITIAL_PRICE = 1.10550;
 const INITIAL_RSI = 50.00;
 const TRADE_SIZE = 10000; 
 const BASE_SPREAD = 0.00015; 
@@ -56,4 +56,37 @@ export const generateNextMinuteData = (prevData) => {
         minute: prevData.minute + 1,
         orderBook: generateMockOrderBook(nextPrice),
     };
+};
+
+// --- New exports to satisfy App.jsx imports ---
+
+export const fetchWithRetry = async (url, options = {}, retries = 3, backoff = 500) => {
+    try {
+        const res = await fetch(url, options);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res;
+    } catch (err) {
+        if (retries > 0) {
+            await new Promise(r => setTimeout(r, backoff));
+            return fetchWithRetry(url, options, retries - 1, backoff * 1.5);
+        }
+        throw err;
+    }
+};
+
+/**
+ * Simple rule-based decision helper for simulation:
+ * - BUY when RSI < 30 and no current position
+ * - SELL when RSI > 70 and there is a current long position
+ * - PASS otherwise
+ */
+export const getTradingDecision = (ticker, data, currentPosition) => {
+    const rsi = data?.rsi ?? 50;
+    if (rsi < 30 && currentPosition === 0) {
+        return { action: 'BUY', rationale: `RSI ${rsi.toFixed(2)} below 30` };
+    }
+    if (rsi > 70 && currentPosition > 0) {
+        return { action: 'SELL', rationale: `RSI ${rsi.toFixed(2)} above 70` };
+    }
+    return { action: 'PASS', rationale: `No strong signal (RSI ${rsi.toFixed(2)})` };
 };

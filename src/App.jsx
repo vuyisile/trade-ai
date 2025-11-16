@@ -3,14 +3,19 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 // Firebase Imports
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, doc, setDoc } from 'firebase/firestore';
+import { getFirestore, doc, setDoc, setLogLevel, onSnapshot } from 'firebase/firestore';
+
+// Local helpers/constants (ensure helpers.js exports these)
+import { TRADE_SIZE, TRADING_FEE, appId, firebaseConfig, initialAuthToken } from './utils/helpers';
+
+// UI Components (atomic structure)
+import MetricItem from './components/atoms/MetricItem';
+import DataBox from './components/atoms/DataBox';
+import OrderBookDisplay from './components/organisms/OrderBookDisplay';
+import TradeHistoryTable from './components/organisms/TradeHistoryTable';
 
 // --- MANDATORY FIREBASE SETUP ---
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
-const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
-
-// --- API CONSTANTS (FIXED 401 ERROR HERE) ---
+// Accessing global variables with safety checks to resolve 'no-undef' errors
 const GEMINI_API_KEY = ""; // Must remain empty for environment injection
 const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${GEMINI_API_KEY}`;
 
@@ -21,6 +26,7 @@ const fetchWithRetry = async (url, options, retries = 3) => {
         try {
             const response = await fetch(url, options);
             if (!response.ok) {
+                // Only retry on rate limit (429)
                 if (response.status !== 429 || i === retries - 1) {
                     throw new Error(`HTTP error! Status: ${response.status}`);
                 }
@@ -29,17 +35,22 @@ const fetchWithRetry = async (url, options, retries = 3) => {
         } catch (error) {
             if (i < retries - 1 && error.message.includes('429')) {
                 const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
-                console.warn(`Rate limit encountered. Retrying in ${delay / 1000}s...`);
                 await new Promise(resolve => setTimeout(resolve, delay));
             } else {
                 throw error;
             }
         }
     }
+    throw new Error("Fetch failed after all retries.");
 };
 
 // Gemini API Call Function for Structured Trading Decision
 const getTradingDecision = async (ticker, data, currentPosition) => {
+    // Check if order book data is valid before accessing
+    if (!data.orderBook || data.orderBook.bids.length === 0 || data.orderBook.asks.length === 0) {
+        return { action: 'PASS', rationale: 'Order book data is incomplete or corrupted.', strategyRecommendation: 'N/A' };
+    }
+    
     // Extract top bid/ask for prompt
     const topBidPrice = data.orderBook.bids[0].price;
     const topBidSize = data.orderBook.bids[0].size;
@@ -53,8 +64,8 @@ const getTradingDecision = async (ticker, data, currentPosition) => {
     You must output **ONLY** a single JSON object. Do not include any text outside the JSON block.
     
     ACTION definitions:
-    - BUY: Enter a long position or increase the current long position.
-    - SELL: Exit the current long position.
+    - BUY: Enter a long position or increase the current long position (if currentPosition is 0, enter a new position).
+    - SELL: Exit the current long position (only if currentPosition > 0).
     - PASS: Take no action. Wait for a clearer signal.`;
 
     const userQuery = `Analyze the current 1-minute data for ${ticker}: 
@@ -67,7 +78,7 @@ const getTradingDecision = async (ticker, data, currentPosition) => {
     
     Current Position: ${currentPosition} units. 
     
-    Provide the best trading decision (BUY, SELL, or PASS) and a one-sentence rationale. Enable Google Search grounding for real-time sentiment.`;
+    Provide the best trading decision (BUY, SELL, or PASS), a one-sentence rationale, and suggest the most suitable high-level strategy for the current conditions (e.g., 'Reversal', 'Trend-Following', 'Range'). Enable Google Search grounding for real-time sentiment.`;
 
     const responseSchema = {
         type: "OBJECT",
@@ -79,9 +90,13 @@ const getTradingDecision = async (ticker, data, currentPosition) => {
             "rationale": {
                 "type": "STRING",
                 "description": "A single, concise, one-sentence reason for the action."
+            },
+            "strategyRecommendation": {
+                 "type": "STRING",
+                 "description": "A suggestion for a suitable strategy (e.g., 'Momentum' or 'Reversal') based on current market behavior. Max 15 characters."
             }
         },
-        required: ["action", "rationale"]
+        required: ["action", "rationale", "strategyRecommendation"]
     };
 
     const payload = {
@@ -108,21 +123,23 @@ const getTradingDecision = async (ticker, data, currentPosition) => {
              // Handle potential Markdown backticks if model wraps JSON
             const cleanJsonText = jsonText.replace(/```json|```/g, '').trim();
             const parsed = JSON.parse(cleanJsonText);
-            return { action: parsed.action, rationale: parsed.rationale };
+            return { 
+                action: parsed.action, 
+                rationale: parsed.rationale, 
+                strategyRecommendation: parsed.strategyRecommendation 
+            };
         }
-        return { action: 'PASS', rationale: 'AI failed to generate structured output.' };
+        return { action: 'PASS', rationale: 'AI failed to generate structured output.', strategyRecommendation: 'N/A' };
 
     } catch (error) {
         console.error("Gemini API Error (Structured Decision):", error);
-        return { action: 'PASS', rationale: `API Error: ${error.message}` };
+        return { action: 'PASS', rationale: `API Error: ${error.message}`, strategyRecommendation: 'N/A' };
     }
 };
 
-// --- SIMULATED DATA HELPERS (omitted for brevity, assume working) ---
+// --- SIMULATED DATA HELPERS ---
 const INITIAL_PRICE = 1.10550;
 const INITIAL_RSI = 50.00;
-const TRADE_SIZE = 10000; 
-const TRADING_FEE = 0.0001; 
 const BASE_SPREAD = 0.00015; 
 const BASE_VOLUME = 500000; 
 
@@ -174,7 +191,7 @@ const generateNextMinuteData = (prevData) => {
         rsi: parseFloat(nextRSI.toFixed(2)),
         dailyVolume: prevData.dailyVolume + Math.floor(Math.random() * 500000) - 200000,
         minute: prevData.minute + 1,
-        orderBook: generateMockOrderBook(nextPrice),
+        orderBook: generateMockOrderBook(nextPrice), // Keep generating mock as a fallback
     };
 };
 
@@ -203,9 +220,17 @@ const App = () => {
     const [dbInstance, setDbInstance] = useState(null);
     const [userId, setUserId] = useState('...');
     const intervalRef = useRef(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+    
+    // New state for real-time Order Book data from MT5 Bridge
+    const [realTimeOrderBook, setRealTimeOrderBook] = useState(null);
+    const [latestStrategy, setLatestStrategy] = useState('N/A');
+
 
     // 1. Firebase Initialization & Auth
     useEffect(() => {
+        setLogLevel('error'); // Suppress Firebase debug logs unless needed
+
         const initFirebase = async () => {
             try {
                 const app = initializeApp(firebaseConfig);
@@ -225,11 +250,14 @@ const App = () => {
                         const userCred = await signInAnonymously(auth);
                         setUserId(userCred.user.uid);
                     }
+                    setIsAuthReady(true);
                 });
             } catch (err) {
                 console.error("Firebase Initialization Error:", err);
+                setError("Firebase initialization failed. Trading signals cannot be bridged.");
                 // Fallback userId if Firebase setup fails
                 setUserId('auth-failed-' + (crypto.randomUUID ? crypto.randomUUID() : 'default'));
+                setIsAuthReady(true);
             }
         };
 
@@ -238,16 +266,48 @@ const App = () => {
         } else {
             // Mock initialization if outside canvas
             setUserId('mock-user-id-12345');
+            setIsAuthReady(true);
         }
     }, []);
 
+    // 2. Real-Time Order Book Listener (The Fix)
+    useEffect(() => {
+        // Only run if Firebase is initialized and we have a ticker
+        if (!isAuthReady || !dbInstance || !stockTicker) return;
+
+        // Path: /artifacts/{appId}/public/data/order_books/{stockTicker}
+        const orderBookRef = doc(dbInstance, 'artifacts', appId, 'public', 'data', 'order_books', stockTicker);
+
+        // Set up real-time listener
+        const unsubscribe = onSnapshot(orderBookRef, (docSnapshot) => {
+            if (docSnapshot.exists()) {
+                const data = docSnapshot.data();
+                // We assume the MQL5 bridge writes data structured as { bids: [...], asks: [...] }
+                if (data && data.bids && data.asks) {
+                    setRealTimeOrderBook(data);
+                    console.log(`[FIREBASE] Received real-time Order Book for ${stockTicker}`);
+                }
+            } else {
+                setRealTimeOrderBook(null);
+                console.warn(`[FIREBASE] Order Book document not found for ${stockTicker}. Using mock data.`);
+            }
+        }, (error) => {
+            console.error("[FIREBASE] Error fetching real-time Order Book:", error);
+            setError("Failed to stream Order Book data.");
+        });
+
+        // Cleanup function for the listener
+        return () => unsubscribe();
+    }, [isAuthReady, dbInstance, stockTicker]);
+
     // --- AI SIGNAL DISPATCH BRIDGE ---
-    const saveSignalToBridge = useCallback(async (action, rationale, price) => {
-        // Only attempt to save if we have the database instance and a valid userId
-        if (!dbInstance || userId === '...' || action === 'PASS') {
+    const saveSignalToBridge = useCallback(async (action, rationale, price, strategyRecommendation) => {
+        // Only proceed if auth is ready, we have db, and a meaningful action is taken
+        if (!isAuthReady || !dbInstance || userId === '...' || action === 'PASS') {
             return;
         }
 
+        // Path: /artifacts/{appId}/public/data/signals/{userId}
         const signalRef = doc(dbInstance, 'artifacts', appId, 'public', 'data', 'signals', userId);
         const signalData = {
             timestamp: Date.now(),
@@ -256,30 +316,38 @@ const App = () => {
             price: price, // The current simulated price
             tradeSize: TRADE_SIZE, // Fixed unit size
             rationale: rationale,
+            strategy: strategyRecommendation, // NEW FIELD: Strategy suggestion from AI
             status: 'NEW_SIGNAL', // Status for external EA to acknowledge
         };
 
         try {
             await setDoc(signalRef, signalData);
-            console.log(`[BRIDGE] Signal ${action} written for user ${userId}`);
         } catch (e) {
             console.error("[BRIDGE] Error writing signal to Firestore bridge:", e);
+            setError("Failed to write trading signal to the public bridge.");
         }
-    }, [dbInstance, userId, stockTicker]);
+    }, [isAuthReady, dbInstance, userId, stockTicker]);
     // ---------------------------------
 
     // Trading Logic (Action Execution)
-    const executeTrade = useCallback((action, rationale) => {
-        // ... (rest of executeTrade logic remains the same for simulation purposes)
+    const executeTrade = useCallback((action, rationale, strategyRecommendation) => {
         const entryPrice = data.currentPrice;
         let newPosition = currentPosition;
         let pnlChange = 0;
         let newBalance = balance;
+        
+        setLatestStrategy(strategyRecommendation); // Update strategy display
 
         const grossCostOrProceeds = entryPrice * TRADE_SIZE; 
         const fee = TRADE_SIZE * TRADING_FEE; 
         
         if (action === 'BUY') {
+            // Only allow BUY if current position is 0 (for simplicity in this sim)
+            if (currentPosition > 0) {
+                 setError(`Cannot BUY. Already have a long position. Must SELL first or increase lot size logic.`);
+                 return;
+            }
+            
             const netCost = grossCostOrProceeds + fee;
             
             if (balance >= netCost) {
@@ -292,11 +360,11 @@ const App = () => {
                     id: Date.now(),
                     minute: data.minute,
                     time: new Date().toLocaleTimeString(),
-                    action,
+                    action: 'BUY',
                     shares: TRADE_SIZE,
                     price: entryPrice,
                     rationale,
-                    pnl: -fee,
+                    pnl: 0, // PNL starts calculating at close
                     fee: fee,
                 };
                 setTradeHistory(prev => [newTrade, ...prev]);
@@ -304,19 +372,25 @@ const App = () => {
                 setError(`Cannot BUY ${TRADE_SIZE} units. Insufficient funds.`);
             }
         } else if (action === 'SELL' && currentPosition > 0) {
+            // Find the original BUY trade details
+            const buyTrade = tradeHistory.find(t => t.action === 'BUY' && t.shares === currentPosition);
+            
+            if (!buyTrade) {
+                 setError('SELL failed: Could not find matching BUY entry.');
+                 return;
+            }
+
             const exitValue = entryPrice * currentPosition;
             const closingFee = currentPosition * TRADING_FEE;
-            const netProceeds = exitValue - closingFee;
             
-            const totalBuyCost = tradeHistory
-                .filter(t => t.action === 'BUY')
-                .reduce((sum, trade) => sum + (trade.price * trade.shares) + trade.fee, 0); 
+            // Calculate PNL based on the entry price
+            const entryCost = buyTrade.price * buyTrade.shares;
+            pnlChange = (exitValue - entryCost) - buyTrade.fee - closingFee;
             
-            pnlChange = netProceeds - totalBuyCost;
-            newBalance += netProceeds;
+            newBalance += (exitValue - closingFee); // Add net proceeds back to balance
             
             setTradeHistory(prev => {
-                const historyCopy = [...prev];
+                const historyCopy = prev.filter(t => t.id !== buyTrade.id); // Remove original BUY trade if using simple simulation model
                 const closingTrade = {
                     id: Date.now() + 1,
                     minute: data.minute,
@@ -328,7 +402,7 @@ const App = () => {
                     pnl: pnlChange,
                     fee: closingFee,
                 };
-                return [closingTrade, ...historyCopy];
+                return [closingTrade, ...historyCopy]; // Add closing trade
             });
 
             setCurrentPosition(0);
@@ -337,12 +411,12 @@ const App = () => {
             setError('Cannot SELL, no current long position to close.');
         }
 
-        if (action !== 'PASS') {
-            console.log(`${action} executed at ${entryPrice.toFixed(5)} | New Position: ${newPosition}`);
-        }
-    }, [balance, currentPosition, data.currentPrice, data.minute, tradeHistory]);
+        // Ensure status is cleared if action was PASS or a successful trade
+        if (error && action !== 'BUY') setError('');
 
-    // 2. The Core Trading Loop (Simulated 1-Minute)
+    }, [balance, currentPosition, data.currentPrice, data.minute, tradeHistory, error]);
+
+    // 3. The Core Trading Loop (Simulated 1-Minute)
     const runSimulationStep = useCallback(async () => {
         if (!trading || isLoading || !stockTicker) return;
 
@@ -350,17 +424,33 @@ const App = () => {
         setError('');
 
         try {
-            // 1. Generate new market data
-            setData(prev => generateNextMinuteData(prev));
+            // 1. Generate next simulated market data (price, RSI, volume, and mock order book)
+            const nextSimulatedData = generateNextMinuteData(data);
             
-            // 2. Get AI Decision (structured)
-            const decision = await getTradingDecision(stockTicker, data, currentPosition);
+            // 2. Decide which Order Book to use: Real-time (from MT5) or Mock (simulated)
+            const currentOrderBook = realTimeOrderBook || nextSimulatedData.orderBook;
             
-            // 3. Dispatch Signal (New Bridge Step!)
-            await saveSignalToBridge(decision.action, decision.rationale, data.currentPrice);
+            // 3. Prepare the combined data object for the AI decision
+            // Uses the new simulated price/RSI/volume, but the best available Order Book
+            const combinedDataForAI = {
+                ...nextSimulatedData,
+                orderBook: currentOrderBook 
+            };
             
-            // 4. Execute Trade (for local simulation/P&L tracking)
-            executeTrade(decision.action, decision.rationale);
+            // 4. Update local data state for display
+            setData({
+                ...nextSimulatedData,
+                orderBook: currentOrderBook,
+            });
+            
+            // 5. Get AI Decision (structured)
+            const decision = await getTradingDecision(stockTicker, combinedDataForAI, currentPosition);
+            
+            // 6. Dispatch Signal (Bridge Step) - using simulated price
+            await saveSignalToBridge(decision.action, decision.rationale, nextSimulatedData.currentPrice, decision.strategyRecommendation);
+            
+            // 7. Execute Trade (for local simulation/P&L tracking)
+            executeTrade(decision.action, decision.rationale, decision.strategyRecommendation);
 
         } catch (err) {
             console.error("Simulation step failed:", err);
@@ -368,12 +458,12 @@ const App = () => {
         } finally {
             setIsLoading(false);
         }
-    }, [trading, isLoading, data, currentPosition, executeTrade, stockTicker, saveSignalToBridge]);
+    }, [trading, isLoading, data, currentPosition, executeTrade, stockTicker, saveSignalToBridge, realTimeOrderBook]);
 
-    // 3. Setup and Teardown of the Interval (omitted for brevity, assume working)
+    // 4. Setup and Teardown of the Interval
     useEffect(() => {
         if (trading) {
-            intervalRef.current = setInterval(runSimulationStep, 3000); 
+            intervalRef.current = setInterval(runSimulationStep, 3000); // 3 seconds simulates 1 minute
         } else {
             clearInterval(intervalRef.current);
         }
@@ -383,14 +473,17 @@ const App = () => {
     
     const toggleTrading = () => setTrading(prev => !prev);
     
-    // Calculate P&L for display (omitted for brevity, assume working)
-    const totalBuyCost = tradeHistory.filter(t => t.action === 'BUY').reduce((sum, t) => sum + (t.price * t.shares) + t.fee, 0);
-    const currentMarketValue = currentPosition * data.currentPrice;
-    const unrealizedPnl = currentMarketValue - totalBuyCost;
+    // Calculate P&L for display
+    const lastBuyTrade = tradeHistory.find(t => t.action === 'BUY');
     
+    const unrealizedPnl = lastBuyTrade && currentPosition > 0
+        ? (currentPosition * data.currentPrice) - (lastBuyTrade.price * currentPosition) - (lastBuyTrade.fee * 2) // Gross PNL - entry fee - estimated closing fee
+        : 0;
+
     const realizedPnl = tradeHistory
         .filter(t => t.action === 'CLOSE_LONG')
         .reduce((sum, t) => sum + t.pnl, 0);
+        
     const totalPnl = realizedPnl + unrealizedPnl;
     
     const pnlStyle = totalPnl >= 0 ? 'text-green-500' : 'text-red-500';
@@ -398,12 +491,17 @@ const App = () => {
     const formatPrice = (price) => price.toFixed(5);
     const formatPnl = (pnl) => `$${pnl.toFixed(2)}`;
 
+    // Get the latest trade (could be BUY or CLOSE_LONG)
+    const latestTrade = tradeHistory.find(t => t.action === 'BUY' || t.action === 'CLOSE_LONG');
+
     return (
         <div className="min-h-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100 p-4 sm:p-8 font-inter">
             <script src="https://cdn.tailwindcss.com"></script>
             <style>{`
                 html, body, #root { height: 100%; }
                 .font-inter { font-family: 'Inter', sans-serif; }
+                .pnl-green { color: #10B981; }
+                .pnl-red { color: #EF4444; }
             `}</style>
             
             <header className="mb-8 border-b border-gray-200 dark:border-gray-800 pb-4">
@@ -419,7 +517,10 @@ const App = () => {
                         Your unique **User ID** (for the EA to read): <span className="font-extrabold text-gray-900 dark:text-white">{userId}</span>
                     </p>
                     <p className="font-mono text-xs text-yellow-700 dark:text-yellow-400 break-all">
-                        The EA must watch this public document path: `/artifacts/{appId}/public/data/signals/{userId}`
+                        The EA must watch this public document path: <code className="bg-yellow-200 dark:bg-yellow-800/50 p-1 rounded">/artifacts/{appId}/public/data/signals/{userId}</code>
+                    </p>
+                    <p className="font-mono text-xs text-yellow-700 dark:text-yellow-400 break-all font-bold mt-2">
+                        Order Book is READ from this path: <code className="bg-yellow-200 dark:bg-yellow-800/50 p-1 rounded">/artifacts/{appId}/public/data/order_books/{stockTicker}</code>
                     </p>
                 </div>
             </header>
@@ -464,19 +565,19 @@ const App = () => {
                 </div>
             )}
             
-            {/* Dashboard Grid (omitted for brevity, assume working) */}
+            {/* Dashboard Grid */}
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
                 
                 {/* Metrics Card */}
                 <div className="lg:col-span-1 p-5 bg-white dark:bg-gray-800 rounded-xl shadow-lg border-l-4 border-blue-500 dark:border-blue-400">
                     <h3 className="text-xl font-bold mb-4 text-blue-600 dark:text-blue-400">Portfolio & Market Metrics</h3>
                     <div className="space-y-3">
-                        <MetricItem label="Cash Balance (USD)" value={formatPnl(balance)} color="text-yellow-600" />
-                        <MetricItem label="Current Position (Units)" value={`${currentPosition.toFixed(0)}`} color="text-indigo-600" />
-                        <MetricItem label="Current Price" value={formatPrice(data.currentPrice)} color={data.currentPrice - INITIAL_PRICE >= 0 ? 'text-green-600' : 'text-red-600'} />
+                        <MetricItem label="Cash Balance (USD)" value={formatPnl(balance)} color="text-yellow-600 dark:text-yellow-400" />
+                        <MetricItem label="Current Position (Units)" value={`${currentPosition.toFixed(0)}`} color="text-indigo-600 dark:text-indigo-400" />
+                        <MetricItem label="Current Price" value={formatPrice(data.currentPrice)} color={data.currentPrice - INITIAL_PRICE >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'} />
                         <MetricItem label="RSI" value={data.rsi.toFixed(2)} color={data.rsi > 70 ? 'text-red-500' : data.rsi < 30 ? 'text-green-500' : 'text-yellow-500'} />
                         <MetricItem label="Total P&L (Net USD)" value={formatPnl(totalPnl)} color={pnlStyle} />
-                        <MetricItem label="Realized P&L" value={formatPnl(realizedPnl)} color={realizedPnl >= 0 ? 'text-green-600' : 'text-red-600'} />
+                        <MetricItem label="Unrealized P&L" value={formatPnl(unrealizedPnl)} color={unrealizedPnl >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'} />
                     </div>
                 </div>
 
@@ -484,14 +585,17 @@ const App = () => {
                 <div className="lg:col-span-1 p-5 bg-white dark:bg-gray-800 rounded-xl shadow-lg border-l-4 border-green-500 dark:border-green-400">
                     <h3 className="text-xl font-bold mb-4 text-green-600 dark:text-green-400">AI Decision Summary</h3>
                     <div className="space-y-4">
-                        <DataBox label="Last Action" value={tradeHistory[0]?.action || 'PASS'} color={getActionStyle(tradeHistory[0]?.action).color} />
-                        <DataBox label="Last Rationale" value={tradeHistory[0]?.rationale || 'Awaiting signal from AI...'} isRationale={true} />
+                        <DataBox label="Last Action" value={latestTrade?.action || 'PASS'} color={getActionStyle(latestTrade?.action).color} />
+                        <DataBox label="Strategy Rec." value={latestStrategy} color="text-purple-500 dark:text-purple-400" />
+                        <DataBox label="Last Rationale" value={latestTrade?.rationale || 'Awaiting signal from AI...'} isRationale={true} />
                     </div>
                 </div>
 
                 {/* Order Book Card */}
                 <div className="lg:col-span-1 p-5 bg-white dark:bg-gray-800 rounded-xl shadow-lg border-l-4 border-yellow-500 dark:border-yellow-400">
-                    <h3 className="text-xl font-bold mb-4 text-yellow-600 dark:text-yellow-400">Simulated Order Book (Level 2)</h3>
+                    <h3 className="text-xl font-bold mb-4 text-yellow-600 dark:text-yellow-400">
+                        {realTimeOrderBook ? 'LIVE' : 'SIMULATED'} Order Book (Level 2)
+                    </h3>
                     <OrderBookDisplay orderBook={data.orderBook} currentPrice={data.currentPrice} formatPrice={formatPrice} />
                 </div>
             </div>
@@ -510,130 +614,5 @@ const App = () => {
         </div>
     );
 };
-
-// --- Sub-Components (omitted for brevity, assume working) ---
-const OrderBookDisplay = ({ orderBook, currentPrice, formatPrice }) => {
-    // Determine Max Volume for bar width scaling
-    const maxVolume = Math.max(
-        ...orderBook.bids.map(b => b.size),
-        ...orderBook.asks.map(a => a.size)
-    );
-
-    return (
-        <div className="space-y-1">
-            {/* Asks (Sellers) */}
-            <div className="text-xs font-semibold text-gray-500 dark:text-gray-400 flex justify-between">
-                <span>VOLUME (UNITS)</span><span>PRICE (ASK)</span>
-            </div>
-            {orderBook.asks.map((ask, index) => (
-                <div key={`ask-${index}`} className="flex justify-between items-center text-red-500 text-sm font-mono relative">
-                    {/* Volume Bar */}
-                    <div className="absolute top-0 right-0 h-full bg-red-500/10" style={{ width: `${(ask.size / maxVolume) * 100}%` }}></div>
-                    <span className="relative z-10">{formatPrice(ask.price)}</span>
-                    <span className="relative z-10">{ask.size.toFixed(0)}</span>
-                </div>
-            ))}
-            
-            {/* Current Price Marker */}
-            <div className="text-center py-2 text-lg font-extrabold text-white bg-gray-700 rounded-sm my-1 shadow-md">
-                {formatPrice(currentPrice)}
-            </div>
-
-            {/* Bids (Buyers) */}
-            <div className="text-xs font-semibold text-gray-500 dark:text-gray-400 flex justify-between">
-                <span>PRICE (BID)</span><span>VOLUME (UNITS)</span>
-            </div>
-            {orderBook.bids.map((bid, index) => (
-                <div key={`bid-${index}`} className="flex justify-between items-center text-green-500 text-sm font-mono relative">
-                    {/* Volume Bar */}
-                    <div className="absolute top-0 left-0 h-full bg-green-500/10" style={{ width: `${(bid.size / maxVolume) * 100}%` }}></div>
-                    <span className="relative z-10">{formatPrice(bid.price)}</span>
-                    <span className="relative z-10">{bid.size.toFixed(0)}</span>
-                </div>
-            ))}
-        </div>
-    );
-};
-
-
-const MetricItem = ({ label, value, color }) => (
-    <div className="flex justify-between items-center border-b border-gray-100 dark:border-gray-700 pb-2">
-        <span className="text-sm font-medium text-gray-500 dark:text-gray-400">{label}</span>
-        <span className={`text-lg font-extrabold ${color}`}>{value}</span>
-    </div>
-);
-
-const DataBox = ({ label, value, trend, isRSI = false, isRationale = false, color }) => {
-    let trendColor = 'text-gray-500';
-    
-    if (isRSI) {
-        const rsiValue = parseFloat(value);
-        if (rsiValue > 70) { trendColor = 'text-red-500'; }
-        else if (rsiValue < 30) { trendColor = 'text-green-500'; }
-        else { trendColor = 'text-yellow-500'; }
-    }
-    
-    const displayValue = isRationale ? value : value;
-    const valueColor = color || trendColor;
-
-    return (
-        <div className="p-3 bg-gray-50 dark:bg-gray-700 rounded-lg shadow-inner min-h-20 flex flex-col justify-center">
-            <p className="text-xs uppercase font-semibold text-gray-400 dark:text-gray-500 mb-1">{label}</p>
-            <div className="flex items-center space-x-2">
-                <span className={`text-md font-bold ${valueColor}`}>{displayValue}</span>
-            </div>
-        </div>
-    );
-};
-
-const TradeHistoryTable = ({ history, formatPrice, formatPnl }) => (
-    <div className="overflow-x-auto">
-        <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
-            <thead className="bg-gray-100 dark:bg-gray-700">
-                <tr>
-                    {['Time', 'Action', 'Units', 'Price', 'Fee (USD)', 'P&L (Net USD)', 'Rationale'].map(header => (
-                        <th key={header} className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase tracking-wider">
-                            {header}
-                        </th>
-                    ))}
-                </tr>
-            </thead>
-            <tbody className="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                {history.length === 0 ? (
-                    <tr>
-                        <td colSpan="7" className="px-4 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400 text-center">
-                            No trades executed yet. Start the bot!
-                        </td>
-                    </tr>
-                ) : (
-                    history.slice(0, 10).map((trade) => {
-                        const style = getActionStyle(trade.action);
-                        const pnlColor = trade.pnl > 0 ? 'text-green-500' : trade.pnl < 0 ? 'text-red-500' : 'text-gray-500';
-                        const feeDisplay = trade.fee ? `$${trade.fee.toFixed(4)}` : '—';
-                        
-                        let pnlDisplay = '—';
-                        if (trade.action === 'CLOSE_LONG') {
-                            pnlDisplay = formatPnl(trade.pnl);
-                        } else if (trade.action === 'BUY') {
-                            pnlDisplay = '—';
-                        }
-                        
-                        return (
-                            <tr key={trade.id} className="hover:bg-gray-50 dark:hover:bg-gray-700">
-                                <td className="px-4 py-3 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-white">{trade.time}</td>
-                                <td className={`px-4 py-3 whitespace-nowrap text-sm font-bold ${style.color}`}>{trade.action}</td>
-                                <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">{trade.shares.toFixed(0)}</td>
-                                <td className="px-4 py-3 whitespace-nowrap text-sm font-mono text-gray-700 dark:text-gray-300">{formatPrice(trade.price)}</td>
-                                <td className="px-4 py-3 whitespace-nowrap text-sm font-mono text-gray-700 dark:text-gray-300">{feeDisplay}</td>
-                                <td className={`px-4 py-3 whitespace-nowrap text-sm font-bold ${pnlColor}`}>{pnlDisplay}</td>
-                                <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400 max-w-xs truncate" title={trade.rationale}>{trade.rationale}</td>
-                            </tr>
-                        );
-                    })
-                )}
-            </tbody>
-        </table>
-    </div>
-);
 
 export default App;

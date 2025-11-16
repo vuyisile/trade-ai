@@ -1,0 +1,151 @@
+//+------------------------------------------------------------------+
+//|                                              TradingExecutor.mq5 |
+//|                                 Copyright 2025, Gemini Analytics |
+//|                                                                  |
+//| This Expert Advisor is the blueprint for executing trades.       |
+//| In a real setup, the Firestore bridge would poll the signal path |
+//| and call the MQL5 Trade function via a DLL or local web server.  |
+//+------------------------------------------------------------------+
+#property version "1.00"
+#property strict
+
+// Include the standard MQL5 trade library
+#include <Trade\Trade.mqh>
+
+// --- INPUT PARAMETERS ---
+input double LotSize = 0.1;           // Trading volume (in lots)
+input int    MagicNumber = 12345;     // Unique ID for the EA's trades
+input int    SignalCheckInterval = 5; // How often to check for a new signal (in seconds)
+
+// --- GLOBAL VARIABLES ---
+CTrade Trade;                     // Instance of the MQL5 CTrade class for trading operations
+datetime lastSignalTime = 0;      // Timestamp of the last processed signal
+string SignalAction = "PASS";     // Variable to hold the retrieved signal (e.g., "BUY", "SELL", "PASS")
+double SignalPrice = 0.0;         // Variable to hold the signal price
+
+// --- SIMULATED BRIDGE FUNCTION ---
+// NOTE: This function simulates reading from your Firestore bridge. 
+// The actual MQL5 code to connect to Firestore is complex and requires 
+// external libraries (DLLs) or a local web server interface.
+bool CheckForNewSignal()
+{
+    // *** START OF SIMULATION ***
+    // Replace this section with your actual code to read the Firestore document:
+    // /artifacts/{appId}/public/data/signals/{userId}
+    
+    // For demonstration, we simulate a 'BUY' signal every 10 ticks.
+    static int tickCounter = 0;
+    tickCounter++;
+    
+    if (tickCounter % 10 == 0)
+    {
+        SignalAction = "BUY";
+        SignalPrice = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
+        lastSignalTime = TimeCurrent();
+        Print("Simulated NEW BUY SIGNAL received from AI bridge at price: ", SignalPrice);
+        return true;
+    }
+    
+    SignalAction = "PASS";
+    return false;
+    // *** END OF SIMULATION ***
+}
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    Trade.SetExpertMagicNumber(MagicNumber);
+    Trade.SetTypeFilling(ORDER_FILLING_FOK); // Fill or Kill order execution policy
+    Print("TradingExecutor EA initialized. Lot size: ", DoubleToString(LotSize));
+    return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    // Check if we need to check the bridge only once per interval
+    static datetime lastCheckTime = 0;
+    if (TimeCurrent() - lastCheckTime < SignalCheckInterval)
+    {
+        return; // Wait for the next interval
+    }
+    lastCheckTime = TimeCurrent();
+    
+    if (CheckForNewSignal())
+    {
+        ExecuteAITrade(SignalAction, SignalPrice);
+        
+        // In a real system, you would now WRITE back to the Firestore document 
+        // to set the status to 'EXECUTED' so the React app knows the trade was taken.
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Core trading logic                                               |
+//+------------------------------------------------------------------+
+void ExecuteAITrade(string action, double price)
+{
+    // Get symbol information
+    MqlTick currentTick;
+    SymbolInfoTick(Symbol(), currentTick);
+    
+    // Normalize lot size to the minimum allowed
+    double volume = Trade.NormalizeVolume(LotSize);
+
+    if (action == "BUY")
+    {
+        // 1. Check for existing open positions before opening a new one
+        if (PositionSelect(Symbol()))
+        {
+            Print("BUY signal: Position already open, passing.");
+            return;
+        }
+
+        // 2. Execute the Buy operation at the current Ask price
+        if (Trade.Buy(volume, Symbol(), currentTick.ask, 0, 0, "AI BUY Signal"))
+        {
+            Print("Trade executed successfully: BUY ", volume, " lots at ", currentTick.ask);
+        }
+        else
+        {
+            Print("Trade execution failed: BUY. Error: ", Trade.ResultRetcode(), " - ", Trade.ResultComment());
+        }
+    }
+    else if (action == "SELL") // This is typically used to close a long position in this context
+    {
+        // 1. Check if we have an existing position to close
+        if (PositionSelect(Symbol()) && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+        {
+            // 2. Close the open position
+            if (Trade.PositionClose(Symbol(), 0)) // 0 means close the whole position
+            {
+                Print("Trade executed successfully: CLOSE LONG position at ", currentTick.bid);
+            }
+            else
+            {
+                Print("Position closing failed: SELL. Error: ", Trade.ResultRetcode(), " - ", Trade.ResultComment());
+            }
+        }
+        else
+        {
+            Print("SELL signal: No matching long position to close, passing.");
+        }
+    }
+    else
+    {
+        Print("PASS signal received. No trade executed.");
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    Print("TradingExecutor EA deinitialized.");
+}
+//+------------------------------------------------------------------+

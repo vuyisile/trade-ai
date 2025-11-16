@@ -1,0 +1,81 @@
+//+------------------------------------------------------------------+
+//|                                              OrderBookReader.mq5 |
+//|                                 Copyright 2025, Gemini Analytics |
+//|                                                                  |
+//| This Expert Advisor reads the Depth of Market (Order Book) data  |
+//| and logs the top 5 bid/ask levels to the terminal's Experts tab. |
+//| For a real application, you would replace the Print() function   |
+//| with a JSON formatting and external API/database call.           |
+//+------------------------------------------------------------------+
+#property version "1.00"
+#property strict
+
+// Global array to store market depth data
+MqlBookInfo book[];
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    Print("OrderBookReader EA initialized. Checking for market depth support...");
+    
+    // Check if Depth of Market is available for the current symbol
+    if(!SymbolInfoInteger(Symbol(), SYMBOL_VISIBLE_DEPTH))
+    {
+        Print("Depth of Market is NOT available for ", Symbol());
+        return(INIT_FAILED);
+    }
+    
+    Print("Depth of Market is available. Starting monitoring.");
+    return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    Print("OrderBookReader EA deinitialized.");
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function - runs on every price change                |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    // Request a snapshot of the current Order Book
+    if(MarketBookGet(Symbol(), book) > 0)
+    {
+        string bid_string = "BIDS (Price / Volume): ";
+        string ask_string = "ASKS (Price / Volume): ";
+        int bids_count = 0;
+        int asks_count = 0;
+        
+        // Loop through the data to separate bids and asks
+        for(int i = 0; i < ArraySize(book); i++)
+        {
+            if(book[i].type == BOOK_TYPE_BUY) // Bids
+            {
+                if (bids_count < 5) 
+                {
+                    bid_string += StringFormat(" %s / %d |", DoubleToString(book[i].price, Digits()), (int)book[i].volume);
+                    bids_count++;
+                }
+            }
+            else // Asks
+            {
+                if (asks_count < 5) 
+                {
+                    ask_string += StringFormat(" %s / %d |", DoubleToString(book[i].price, Digits()), (int)book[i].volume);
+                    asks_count++;
+                }
+            }
+        }
+        
+        // Output the data (In a real system, you'd send this to your Firestore bridge)
+        Print("Time: ", TimeToString(TimeCurrent(), TIME_SECONDS), " --- ", bid_string);
+        Print("Time: ", TimeToString(TimeCurrent(), TIME_SECONDS), " --- ", ask_string);
+    }
+}
+//+------------------------------------------------------------------+

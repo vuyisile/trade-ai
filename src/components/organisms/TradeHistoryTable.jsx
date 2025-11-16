@@ -1,7 +1,7 @@
 import React from 'react';
-import { getActionStyle } from '../../utils/helpers';
+import { getActionStyle, formatPnl, formatPrice } from '../../utils/helpers';
 
-const TradeHistoryTable = ({ history, formatPrice, formatPnl }) => (
+const TradeHistoryTable = ({ history }) => (
     <div className="overflow-x-auto">
         <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
             <thead className="bg-gray-100 dark:bg-gray-700">
